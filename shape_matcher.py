@@ -196,106 +196,124 @@ class ShapeMatcher:
         return selected
 
     # ---------- 主入口 ----------
-    def match(self, image,
-              angle_start=0.0, angle_extent=2 * np.pi,
-              angle_step=np.radians(1.0),
-              scale_range=(1.0, 1.0),
-              scale_step=0.02,
-              min_score=0.5, num_matches=1, max_overlap=0.5,
-              num_levels=None, step_pixels_top=None,
-              refine_window=2):
-        """
-        返回: [(Row, Column, Angle, Scale, Score), ...]
-        """
-        gray = preprocess(image)
+def match(self, image,
+          angle_start=0.0, angle_extent=2 * np.pi,
+          angle_step=np.radians(1.0),
+          scale_range=(1.0, 1.0),
+          scale_step=0.02,
+          min_score=0.5, num_matches=1, max_overlap=0.5,
+          num_levels=None, step_pixels_top=None,
+          refine_window=2,
+          debug=False):                          # ← NEW
+    """
+    debug=True 时返回 (results, diag)。
+    diag 字段:
+      top_raw       : 顶层通过阈值的候选原始数
+      top_best      : 顶层最佳得分（不论是否过阈值）
+      after_group   : 按尺度分组保留后的候选数
+      per_level     : [(lvl, n_before, n_after), ...] 每层细化前后的候选数
+      final_nms     : 最终 NMS 输出数
+      failed_at     : None | 'TOP' | 'GROUP' | 'L2' | 'L1' | 'L0' | 'NMS'
+    """
+    diag = {
+        'top_raw': 0, 'top_best': -1.0, 'after_group': 0,
+        'per_level': [], 'final_nms': 0, 'failed_at': None,
+    }
 
-        # === 第 1 段: 建金字塔 + 自动降层 ===
-        levels = self.max_levels if num_levels is None else min(num_levels, self.max_levels)
-        levels = max(levels, 1)
-        img_pyr = self._build_image_pyramid(gray, levels)
-        model_pyr = self._build_model_pyramid(levels)
+    gray = preprocess(image)
 
-        while levels > 1 and not self._can_search_at_level(
-                img_pyr[levels - 1], model_pyr[levels - 1]['points']):
-            levels -= 1
-            img_pyr = img_pyr[:levels]
-            model_pyr = model_pyr[:levels]
+    # === 第 1 段: 建金字塔 + 自动降层 ===
+    levels = self.max_levels if num_levels is None else min(num_levels, self.max_levels)
+    levels = max(levels, 1)
+    img_pyr = self._build_image_pyramid(gray, levels)
+    model_pyr = self._build_model_pyramid(levels)
+    while levels > 1 and not self._can_search_at_level(
+            img_pyr[levels - 1], model_pyr[levels - 1]['points']):
+        levels -= 1
+        img_pyr = img_pyr[:levels]
+        model_pyr = model_pyr[:levels]
 
-        top = levels - 1
+    top = levels - 1
+    if step_pixels_top is None:
+        step_pixels_top = 2 if top <= 3 else 3
+    step_top = angle_step * (2 ** top)
 
-        # === 修复 ①: 顶层步长固定为小值, 与层数无关 ===
-        if step_pixels_top is None:
-            step_pixels_top = 2 if top <= 3 else 3
-        step_top = angle_step * (2 ** top)
+    s_min, s_max = scale_range
+    if s_max <= s_min + 1e-9:
+        scales_top = [s_min]
+        scale_prev_step = 0.0
+    else:
+        scales_top = np.arange(s_min, s_max + scale_step / 2, scale_step).tolist()
+        scale_prev_step = scale_step
 
-        # 尺度列表
-        s_min, s_max = scale_range
-        if s_max <= s_min + 1e-9:
-            scales_top = [s_min]
-            scale_prev_step = 0.0
-        else:
-            scales_top = np.arange(s_min, s_max + scale_step / 2, scale_step).tolist()
-            scale_prev_step = scale_step
+    # === 第 2 段: 顶层粗筛 ===
+    min_score_top = min_score * 0.6 if min_score > 0 else min_score
+    ngx, ngy = self._gradients(img_pyr[top])
+    raw_candidates = self._top_level_search(
+        ngx, ngy,
+        model_pyr[top]['points'], model_pyr[top]['angles'],
+        angle_start, angle_extent, step_top,
+        scales_top, min_score_top, step_pixels_top,
+    )
+    diag['top_raw'] = len(raw_candidates)
+    diag['top_best'] = raw_candidates[0][4] if raw_candidates else -1.0
 
-        # === 第 2 段: 顶层粗筛 ===
-        # === 修复 ②: 顶层用放宽阈值, 避免模糊层正确候选被筛掉 ===
-        min_score_top = min_score * 0.6 if min_score > 0 else min_score
+    if not raw_candidates:
+        diag['failed_at'] = 'TOP'
+        return ([], diag) if debug else []
 
-        ngx, ngy = self._gradients(img_pyr[top])
-        candidates = self._top_level_search(
+    # 按尺度分组保留
+    K_per_scale = max(num_matches * 3, 5)
+    by_scale = {}
+    for c in raw_candidates:
+        by_scale.setdefault(round(c[3], 4), []).append(c)
+    kept = []
+    for lst in by_scale.values():
+        kept.extend(lst[:K_per_scale])
+    kept.sort(key=lambda x: -x[4])
+    candidates = kept
+    diag['after_group'] = len(candidates)
+    if not candidates:
+        diag['failed_at'] = 'GROUP'
+        return ([], diag) if debug else []
+
+    # === 第 3 段: 逐层细化 ===
+    current_step = step_top
+    for lvl in range(top - 1, -1, -1):
+        ngx, ngy = self._gradients(img_pyr[lvl])
+        mapped = [(cy * 2.0, cx * 2.0, t, s, sc)
+                  for (cy, cx, t, s, sc) in candidates]
+        next_step = current_step / 2.0
+        next_s_step = scale_prev_step / 2.0 if scale_prev_step > 0 else 0.0
+        n_before = len(candidates)
+        candidates = self._refine_at_level(
             ngx, ngy,
-            model_pyr[top]['points'], model_pyr[top]['angles'],
-            angle_start, angle_extent, step_top,
-            scales_top, min_score_top, step_pixels_top,
+            model_pyr[lvl]['points'], model_pyr[lvl]['angles'],
+            mapped, current_step, next_step,
+            scale_prev_step, next_s_step if next_s_step > 0 else scale_step,
+            min_score, window=refine_window,
         )
+        diag['per_level'].append((lvl, n_before, len(candidates)))
+
         if not candidates:
-            return []
+            diag['failed_at'] = f'L{lvl}'
+            return ([], diag) if debug else []
 
-        # === 修复 ③: 顶层候选保留策略 ===
-        if len(scales_top) == 1:
-            # 单尺度: 退化为全局 top-K
-            K = max(num_matches * 10, 20)
-            candidates = candidates[:K]
-        else:
-            # 多尺度: 每个尺度各自保留 top-K, 避免某个尺度的假阳性挤掉正确候选
-            K_per_scale = max(num_matches * 3, 5)
-            by_scale = {}
-            for c in candidates:
-                key = round(c[3], 4)
-                by_scale.setdefault(key, []).append(c)
-            kept = []
-            for lst in by_scale.values():
-                kept.extend(lst[:K_per_scale])
-            kept.sort(key=lambda x: -x[4])
-            candidates = kept
+        K = max(num_matches * 15, 40)
+        candidates = candidates[:K]
+        current_step = next_step
+        if scale_prev_step > 0:
+            scale_prev_step = next_s_step
 
-        # === 第 3 段: 逐层细化 ===
-        current_step = step_top
-        for lvl in range(top - 1, -1, -1):
-            ngx, ngy = self._gradients(img_pyr[lvl])
-            mapped = [(cy * 2.0, cx * 2.0, t, s, sc)
-                      for (cy, cx, t, s, sc) in candidates]
-            next_step = current_step / 2.0
-            next_s_step = scale_prev_step / 2.0 if scale_prev_step > 0 else 0.0
-            candidates = self._refine_at_level(
-                ngx, ngy,
-                model_pyr[lvl]['points'], model_pyr[lvl]['angles'],
-                mapped, current_step, next_step,
-                scale_prev_step, next_s_step if next_s_step > 0 else scale_step,
-                min_score, window=refine_window,
-            )
-            if not candidates:
-                return []
-            # === 修复 ④: 细化层 K 放宽 ===
-            K = max(num_matches * 15, 40)
-            candidates = candidates[:K]
-            current_step = next_step
-            if scale_prev_step > 0:
-                scale_prev_step = next_s_step
+    # === 第 4 段: NMS ===
+    final = self._select_non_overlapping(
+        candidates, num_matches, max_overlap, self.model.radius)
+    diag['final_nms'] = len(final)
+    if not final:
+        diag['failed_at'] = 'NMS'
+        return ([], diag) if debug else []
 
-        # === 第 4 段: NMS 去重 ===
-        return self._select_non_overlapping(
-            candidates, num_matches, max_overlap, self.model.radius)
+    return (final, diag) if debug else final
 
 
 # ---------- 可视化 ----------
