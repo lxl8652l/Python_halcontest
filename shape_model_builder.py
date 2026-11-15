@@ -492,8 +492,12 @@ def main_create_template(img_path, out_path="shape_model.pkl",
         angular_bins=angular_bins,
         max_points=max_points,
     )
-    print(f"[Model] N={len(model.points)}  "
-          f"center={model.center}  radius={model.radius:.1f}")
+    if len(model.points) > 0:
+        dev = model.radial_dists - model.radius
+        print(f"[偏离统计] mean={dev.mean():.2f} px  "
+              f"std={dev.std():.2f} px  "
+              f"max|dev|={np.abs(dev).max():.2f} px  "
+              f"95%分位={np.percentile(np.abs(dev), 95):.2f} px")
 
     visualize_model(bgr, model, arrow_step=10, radial_tol=radial_tol)
 
