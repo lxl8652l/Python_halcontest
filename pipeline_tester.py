@@ -258,6 +258,84 @@ def auto_build_policy(sample_image_path, model_radius):
         print("[WARN] Hough 未检测到圆，使用全图宽松 Policy")
         return (0, h), (0, w), (0.8, 1.2)
 
+def save_visual_trace(img_bgr, filename, m_res, f_res, out_dir):
+    """
+    拼接 原图 | 粗定位 | 精定位 对比图并保存
+    """
+    h, w = img_bgr.shape[:2]
+    # 统一缩小到高度 600 显示，避免大图拼接太大
+    target_h = 600
+    scale = target_h / h
+    target_w = int(w * scale)
+    
+    # 基础底图
+    base = cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    panel1 = base.copy()
+    panel2 = base.copy()
+    panel3 = base.copy()
+    
+    # --- Panel 1: 仅原图 + 文件名 ---
+    cv2.putText(panel1, f"1. Original", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(panel1, filename, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    # --- Panel 2: 粗定位 ---
+    cv2.putText(panel2, f"2. Coarse Match", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    if m_res is not None:
+        row, col, angle, scale_f, score = m_res
+        cx_r, cy_r, r_r = col, row, model.radius * scale_f
+        
+        # 画黄色虚线圆（用 segment 模拟虚线）
+        circ_r = int(r_r * scale)
+        c_x, c_y = int(cx_r * scale), int(cy_r * scale)
+        
+        # 十字中心
+        cv2.drawMarker(panel2, (c_x, c_y), (0, 255, 255), cv2.MARKER_CROSS, 40, 2)
+        # 圆（黄色）
+        cv2.circle(panel2, (c_x, c_y), circ_r, (0, 255, 255), 2)
+        
+        info2 = f"Score: {score:.3f}"
+        cv2.putText(panel2, info2, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    # --- Panel 3: 精定位 ---
+    cv2.putText(panel3, f"3. Fine Subpixel", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    if f_res is not None:
+        cx_f, cy_f, r_f = f_res["cx"], f_res["cy"], f_res["radius"]
+        inlier = f_res["inlier_ratio"]
+        pts = f_res["valid_points"]
+        
+        c_x_f, c_y_f = int(cx_f * scale), int(cy_f * scale)
+        circ_f = int(r_f * scale)
+        
+        # 红点（缩小时不要太密，可以选择画一部分）
+        for pt in pts[::2]: # 隔一个画一个，避免太糊
+            cv2.circle(panel3, (int(pt[0]*scale), int(pt[1]*scale)), 1, (0, 0, 255), -1)
+            
+        # 绿色实线圆
+        cv2.circle(panel3, (c_x_f, c_y_f), circ_f, (0, 255, 0), 2)
+        cv2.drawMarker(panel3, (c_x_f, c_y_f), (0, 255, 0), cv2.MARKER_CROSS, 40, 2)
+        
+        # 计算修正量
+        if m_res is not None:
+            row, col, _, scale_f, _ = m_res
+            dx = cx_f - col
+            dy = cy_f - row
+            dr = r_f - (model.radius * scale_f)
+            info3 = f"dX:{dx:+.1f} dY:{dy:+.1f} dR:{dr:+.1f}"
+            cv2.putText(panel3, info3, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+        info3_2 = f"Inlier: {inlier*100:.1f}%"
+        cv2.putText(panel3, info3_2, (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    else:
+        cv2.putText(panel3, "Fine Failed", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    # 中间加分隔黑线
+    sep = np.zeros((target_h, 4, 3), dtype=np.uint8)
+    
+    # 横向拼接
+    combined = np.hstack([panel1, sep, panel2, sep, panel3])
+    
+    out_path = os.path.join(out_dir, filename)
+    cv2.imwrite(out_path, combined)
 
 # ============================================================
 # 4. 主测试流水线
@@ -284,6 +362,11 @@ def main():
     records = []
     t_start_all = time.perf_counter()
     
+    # --- 新增可视化目录设置 ---
+    vis_dir = "./pipeline_vis"
+    os.makedirs(os.path.join(vis_dir, "success"), exist_ok=True)
+    os.makedirs(os.path.join(vis_dir, "failed"), exist_ok=True)
+    
     # 3. 遍历测试
     for i, path in enumerate(image_paths):
         filename = os.path.basename(path)
@@ -306,8 +389,10 @@ def main():
             t_match = (time.perf_counter() - t0) * 1000
             
             if not match_res:
-                records.append(PipelineRecord(filename, False, -1, t_match, -1, -1, -1, False, 0, -1, -1, -1, 0, 0, 0, t_match, f"Match fail: {diag.get('failed_at')}"))
+                records.append(...)
                 print("-> Match Failed")
+                # 保存失败图
+                save_visual_trace(img, filename, None, None, os.path.join(vis_dir, "failed"))
                 continue
                 
             row, col, angle, scale, score = match_res[0]
